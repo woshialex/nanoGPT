@@ -98,6 +98,23 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class Conv(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.P_Len = config.conv_len - 1
+        inner = config.n_embd # *2?
+        self.conv = nn.Conv1d(config.n_embd, inner, config.conv_len, padding=self.P_Len, groups=config.conv_groups)
+        self.gelu = nn.GELU()
+        self.proj = nn.Linear(inner, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.conv(x.transpose(-1,-2))[...,:-self.P_Len]
+        x = self.gelu(x)
+        x = self.proj(x.transpose(-1,-2))
+        x = self.dropout(x)
+        return x
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -105,7 +122,10 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        if config.use_conv:
+            self.mlp = Conv(config)
+        else:
+            self.mlp = MLP(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -119,6 +139,9 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    use_conv: bool = False
+    conv_len: int = 8
+    conv_groups: int = 4
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 

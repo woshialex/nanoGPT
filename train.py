@@ -32,6 +32,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+max_epochs = 8
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
@@ -52,6 +53,9 @@ block_size = 1024
 n_layer = 12
 n_head = 12
 n_embd = 768
+use_conv = False
+conv_groups = 4
+conv_len = 12
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
@@ -115,17 +119,42 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+
+#def get_batch(split):
+#    data = train_data if split == 'train' else val_data
+#    ix = torch.randint(len(data) - block_size, (batch_size,))
+#    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+#    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+#    if device_type == 'cuda':
+#        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+#        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+#    else:
+#        x, y = x.to(device), y.to(device)
+#    return x, y
+
+class DataGenerator:
+    def __init__(self, split, batch_size=batch_size, block_size=block_size, device_type=device_type, device=device):
+        self.split = split
+        self.batch_size = batch_size
+        self.block_size = block_size
+        self.device_type = device_type
+        self.device = device
+        self.data = train_data if split == 'train' else val_data
+        self.num_batches = int((len(self.data)- 1) / (self.batch_size * self.block_size))
+        self.num_blocks = self.num_batches * self.batch_size
+
+    def __iter__(self):
+        block_indexes = np.arange(self.num_blocks) * self.block_size
+        np.random.shuffle(block_indexes)
+        for i in range(self.num_batches):
+            start_idx = block_indexes[i * self.batch_size:(i + 1) * self.batch_size]
+            x = torch.stack([torch.from_numpy((self.data[i:i + self.block_size]).astype(np.int64)) for i in start_idx])
+            y = torch.stack([torch.from_numpy((self.data[i + 1:i + 1 + self.block_size]).astype(np.int64)) for i in start_idx])
+            if self.device_type == 'cuda':
+                x, y = x.pin_memory().to(self.device, non_blocking=True), y.pin_memory().to(self.device, non_blocking=True)
+            else:
+                x, y = x.to(self.device), y.to(self.device)
+            yield x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -141,7 +170,7 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size, use_conv=use_conv, conv_groups=conv_groups, conv_len=conv_len,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -214,13 +243,17 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+        with torch.no_grad():
+            total_loss = 0.0
+            c = 0
+            for X, Y in DataGenerator(split):
+                with ctx:
+                    _, loss = model(X, Y)
+                total_loss += loss
+                c += 1
+                if c > eval_iters: #max number of iteration in eval
+                    break
+            out[split] = total_loss/c
     model.train()
     return out
 
@@ -244,13 +277,15 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+train_gen = DataGenerator('train') 
+print("num of batches = ", train_gen.num_batches)
+iter_train = iter(train_gen)
+X,Y = next(iter_train)
 while True:
-
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -297,7 +332,11 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+
+        iter_num += 1
+        if iter_num % train_gen.num_batches == 0:
+            iter_train = iter(train_gen) ##todo: check whether it works!!
+        X,Y = next(iter_train)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
@@ -322,11 +361,10 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-    iter_num += 1
     local_iter_num += 1
 
     # termination conditions
-    if iter_num > max_iters:
+    if iter_num > max_iters or iter_num >= train_gen.num_batches * max_epochs:
         break
 
 if ddp:
